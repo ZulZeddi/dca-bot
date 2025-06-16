@@ -187,6 +187,8 @@ def daily_dca():
         print(err)
         send_telegram(err)
 
+os.chdir(r'd:\Python\my-dca-bot')
+
 daily_dca()  # Run once at startup to ensure initial state
 
 # # ⏰ Schedule to run every day at 10:00 AM
