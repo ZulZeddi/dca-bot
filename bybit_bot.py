@@ -6,6 +6,7 @@ import time
 import pandas as pd
 import schedule # type: ignore
 import os
+import uuid
 
 
 # === Settings ===
@@ -45,7 +46,7 @@ def get_coin_balance(session, coin, account_type='UNIFIED'):
     try:
         balances = session.get_wallet_balance(accountType=account_type, coin=coin)
         available_balance = balances['result']['list'][0]['coin'][0]['walletBalance']
-        return round(float(available_balance), 2)
+        return round(float(available_balance), 6)
     except Exception as e:
         print(f"Error getting {coin} balance: {e}")
         send_telegram(f"❌ Error getting {coin} balance: {e}")
@@ -104,7 +105,7 @@ def stake_or_redeem(session, category, order_type, account_type, amount, coin):
         coin=coin
     )
     productId = productIdInfo['result']['list'][0]['productId']
-    
+    # TODO: add check for minimum amount. Min USD amount=10
     orderLinkId = f"{order_type.lower()}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
     try:
         response = session.stake_or_redeem(
@@ -140,9 +141,7 @@ def calculate_PnL(session):
             pnl = symbol_usd_value - spended_usd
             pnl_pct = round((pnl / spended_usd) * 100 if spended_usd > 0 else 0, 2)
             pnl_pct = f"{pnl_pct:.2f}%"
-            msg = f" - {symbol}: {bought_quantity:.4f} bought, spent {spended_usd:.2f} USD,\
-                current value {symbol_usd_value:.2f} USD\n \
-                Total PnL: {pnl:.2f} USD ({pnl_pct})"
+            msg = f" - {symbol}: {bought_quantity:.4f} bought, spent {spended_usd:.2f} USD, current value {symbol_usd_value:.2f} USD\n{symbol} PnL: {pnl:.2f} USD ({pnl_pct})"
             print(msg)
             send_telegram(msg)
     except Exception as e:
@@ -160,12 +159,14 @@ def run_dca_bot(session):
     print(f"Available {USD_TYPE}: {coin_balance:.2f}")
 
     if coin_balance < (DAILY_USD_ETH + DAILY_USD_SOL):
-        print(f"Insufficient USDT balance for daily DCA: \
-            {coin_balance:.2f} < {DAILY_USD_ETH + DAILY_USD_SOL:.2f}")
+        print(f"Insufficient {USD_TYPE} balance for daily DCA: {coin_balance:.2f} < {DAILY_USD_ETH + DAILY_USD_SOL:.2f}")
         send_telegram(
-            f"❌ Insufficient USDT balance for daily DCA: \
-            {coin_balance:.2f} < {DAILY_USD_ETH + DAILY_USD_SOL:.2f}"
+            f"❌ Insufficient {USD_TYPE} balance for daily DCA: {coin_balance:.2f} < {DAILY_USD_ETH + DAILY_USD_SOL:.2f}"
         )
+
+        #TODO: ADD CHECK volatility GET TICKERS https://bybit-exchange.github.io/docs/v5/market/tickers
+        #TODO: ADD CHECK minOrderQty https://bybit-exchange.github.io/docs/v5/market/instrument
+
         stake_or_redeem(
             session,
             category='FlexibleSaving',
@@ -178,6 +179,9 @@ def run_dca_bot(session):
 
     for symbol, multiplier in CRYPTO_MULTIPLIER.items():
         print(f"Buying {symbol} with {multiplier * DAILY_USD:.2f} {USD_TYPE}...")
+        send_telegram(
+            f"🤖 Buying {symbol} with {multiplier * DAILY_USD:.2f} {USD_TYPE}..."
+        )
         order = convert_coins(
             fromCoin=USD_TYPE,
             toCoin=symbol,
@@ -193,20 +197,19 @@ def run_dca_bot(session):
         )
         # OnChain earn limits: min 0.1 ETH; 0.1 SOL
         # Mining liquidity limits: min 0.01 ETH; 2 SOL
-        sol_balance = get_coin_balance(session, 'SOL', account_type='UNIFIED')
-        eth_balance = get_coin_balance(session, 'ETH', account_type='UNIFIED')
-        if symbol == 'SOL' and sol_balance >= 0.1:
+        coin_balance = get_coin_balance(session, symbol, account_type='UNIFIED')
+        if symbol == 'SOL' and coin_balance >= 0.1:
             stake_or_redeem(
                 session,
                 category='OnChain',
                 order_type='Stake',
                 account_type='UNIFIED',
-                amount=sol_balance,
+                amount=coin_balance,
                 coin=symbol
             )
-        elif symbol == 'ETH' and eth_balance >= 0.01:
+        elif symbol == 'ETH' and coin_balance >= 0.01:
             send_telegram(
-                f"NEED MANUALLY ADD {eth_balance} {symbol} TO MINING LIQUIDITY"
+                f"❗NEED MANUALLY ADD {coin_balance} {symbol} TO MINING LIQUIDITY"
             )
     calculate_PnL(session)
 
@@ -220,13 +223,23 @@ if __name__ == '__main__':
         api_secret=API_SECRET,
         testnet=False  # True for testnet
     )
-    run_dca_bot(session)
+    # run_dca_bot(session)
+    calculate_PnL(session)
+    
+    # transfer = session.create_internal_transfer(
+    #     transferId=f'{uuid.uuid1()}',
+    #     coin='SOL',
+    #     amount='0.01',                                    <<<--- Transfer
+    #     fromAccountType='UNIFIED',
+    #     toAccountType='FUND'
+    # )
+    # print(transfer)
 
     # # ⏰ Schedule to run every day at 10:00 AM
     # schedule.every().day.at("10:00").do(daily_dca)
 
     # print("USDC-based DCA bot started...")
-    # send_telegram("🤖 USDC DCA bot is now running.")
+    # send_telegram("🤖 USDC DCA bot is now running.")      <<<--- Schedule
 
     # while True:
     #     schedule.run_pending()
