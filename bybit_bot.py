@@ -7,6 +7,7 @@ import pandas as pd
 import schedule # type: ignore
 import os
 import uuid
+import numpy as np
 
 
 # === Settings ===
@@ -19,13 +20,12 @@ DAILY_USD = float(os.getenv('DAILY_USD'))
 USD_TYPE = os.getenv('STABLECOIN')
 
 CRYPTO_MULTIPLIER = {
-    'ETH': 0.6,  # 60% of daily USDT
-    'SOL': 0.4   # 40% of daily USDT    
+    'ETH': 0.5,  # 50% of daily USD
+    'SOL': 0.3,   # 30% of daily USD
+    'TON': 0.2    # 20% of daily USD
 }
 
-DAILY_USD_ETH = DAILY_USD * CRYPTO_MULTIPLIER['ETH']
-DAILY_USD_SOL = DAILY_USD * CRYPTO_MULTIPLIER['SOL']
-
+# === Log file ===
 LOG_FILE = 'trade_log.csv'
 
 
@@ -157,11 +157,11 @@ def run_dca_bot(session):
     
     coin_balance = get_coin_balance(session, USD_TYPE, account_type='UNIFIED')
     print(f"Available {USD_TYPE}: {coin_balance:.2f}")
-
-    if coin_balance < (DAILY_USD_ETH + DAILY_USD_SOL):
-        print(f"Insufficient {USD_TYPE} balance for daily DCA: {coin_balance:.2f} < {DAILY_USD_ETH + DAILY_USD_SOL:.2f}")
+    usd_amount_needed = np.sum(list(CRYPTO_MULTIPLIER.values())) * DAILY_USD
+    if coin_balance < (usd_amount_needed):
+        print(f"Insufficient {USD_TYPE} balance for daily DCA: {coin_balance:.2f} < {usd_amount_needed:.2f}")
         send_telegram(
-            f"❌ Insufficient {USD_TYPE} balance for daily DCA: {coin_balance:.2f} < {DAILY_USD_ETH + DAILY_USD_SOL:.2f}"
+            f"❌ Insufficient {USD_TYPE} balance for daily DCA: {coin_balance:.2f} < {usd_amount_needed:.2f}"
         )
 
         #TODO: ADD CHECK volatility GET TICKERS https://bybit-exchange.github.io/docs/v5/market/tickers
@@ -172,7 +172,7 @@ def run_dca_bot(session):
             category='FlexibleSaving',
             order_type='Redeem',
             account_type='UNIFIED',
-            amount=DAILY_USD_ETH + DAILY_USD_SOL,
+            amount=usd_amount_needed,
             coin=USD_TYPE
         )
         time.sleep(7.5)
@@ -199,6 +199,7 @@ def run_dca_bot(session):
         # Mining liquidity limits: min 0.01 ETH; 2 SOL
         coin_balance = get_coin_balance(session, symbol, account_type='UNIFIED')
         if symbol == 'SOL' and coin_balance >= 0.1:
+            print(f"Trying to stake {coin_balance} {symbol} to OnChain Earn...")
             stake_or_redeem(
                 session,
                 category='OnChain',
@@ -211,37 +212,38 @@ def run_dca_bot(session):
             send_telegram(
                 f"❗NEED MANUALLY ADD {coin_balance} {symbol} TO MINING LIQUIDITY"
             )
-    calculate_PnL(session)
 
 
-# === Start ===
-if __name__ == '__main__':
+def daily_dca():
     os.chdir(r'd:\Python\my-dca-bot')
-    # === Client initialization ===
     session = HTTP(
         api_key=API_KEY,
         api_secret=API_SECRET,
         testnet=False  # True for testnet
     )
-    # run_dca_bot(session)
+    run_dca_bot(session)
     calculate_PnL(session)
-    
-    # transfer = session.create_internal_transfer(
-    #     transferId=f'{uuid.uuid1()}',
-    #     coin='SOL',
-    #     amount='0.01',                                    <<<--- Transfer
-    #     fromAccountType='UNIFIED',
-    #     toAccountType='FUND'
-    # )
-    # print(transfer)
 
-    # # ⏰ Schedule to run every day at 10:00 AM
-    # schedule.every().day.at("10:00").do(daily_dca)
 
-    # print("USDC-based DCA bot started...")
-    # send_telegram("🤖 USDC DCA bot is now running.")      <<<--- Schedule
+# === Start ===
+if __name__ == '__main__':
 
-    # while True:
-    #     schedule.run_pending()
-    #     time.sleep(60)
+    # ⏰ Schedule to run every day at 10:00 AM
+    schedule.every().day.at("10:00").do(daily_dca)
 
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
+
+
+
+
+# --- For testing ---
+# transfer = session.create_internal_transfer(
+#     transferId=f'{uuid.uuid1()}',
+#     coin='SOL',
+#     amount='0.01',                                    <<<--- Transfer
+#     fromAccountType='UNIFIED',
+#     toAccountType='FUND'
+# )
+# print(transfer)
