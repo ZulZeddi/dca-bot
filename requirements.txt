@@ -3,3 +3,4 @@ pandas
 schedule
 binance-connector
 python-dotenv
+pybit
