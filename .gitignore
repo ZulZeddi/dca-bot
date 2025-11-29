@@ -1,2 +1,4 @@
 .env
 trade_log.csv
+test.py
+log/
