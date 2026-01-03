@@ -5,20 +5,11 @@ from dotenv import load_dotenv
 from datetime import datetime
 import requests
 import time
-import pandas as pd
 import numpy as np
 from loguru import logger 
+from supabase import create_client
+import pandas as pd
 
-# --- Configure Loguru ---
-logger.remove()
-logger.add(sys.stderr, level="INFO")
-
-# create 'log' directory if it doesn't exist
-if not os.path.exists('log'):
-    os.makedirs('log')
-
-# add file logger with weekly rotation
-logger.add(r"log/dca_bot_{time:YYYY-MM-DD}.log", rotation="1 week", level="DEBUG") 
 
 # === Settings ===
 load_dotenv()
@@ -31,7 +22,7 @@ DAILY_USD = float(os.getenv('DAILY_USD', 0.0))
 # Getting the list of stablecoins, default to 'USDT,USDC'
 stablecoin_env = os.getenv('STABLECOIN_LIST')
 if stablecoin_env is None or stablecoin_env.strip() == '':
-    stablecoin_env = 'USDT,USDC'
+    stablecoin_env = 'USDT, USDC'
     
 STABLECOIN_LIST = [c.strip() for c in stablecoin_env.split(',')] 
 USD_TYPE = STABLECOIN_LIST[0] # Initial primary stablecoin (e.g., USDT)
@@ -40,17 +31,15 @@ USD_TYPE = STABLECOIN_LIST[0] # Initial primary stablecoin (e.g., USDT)
 BUFFER_MULTIPLIER = 1.015 # buffer to cover conversion fees/slippage
 MIN_REDEMPTION_USD = 10.0 # minimum redemption amount from Flexible Saving
 
-# === Log file ===
-LOG_FILE = 'trade_log.csv'
 
 # --- Utility Functions (Telegram, Balance, Convert, Log, Stake/Redeem, Allocation) ---
-
 def send_telegram(message):
     """Sends a notification message to the configured Telegram chat."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         'chat_id': TELEGRAM_CHAT_ID,
-        'text': message
+        'text': message,
+        'parse_mode': 'Markdown'
     }
     try:
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -59,6 +48,7 @@ def send_telegram(message):
             logger.warning("Telegram not configured (missing token/chat ID).")
     except Exception as e:
         logger.error(f"Telegram error: {e}")
+
 
 def get_coin_balance(session, coin, account_type='UNIFIED'):
     """Retrieves the available wallet balance for a specific coin."""
@@ -72,6 +62,7 @@ def get_coin_balance(session, coin, account_type='UNIFIED'):
         logger.error(f"Error getting {coin} balance: {e}")
         send_telegram(f"❌ Error getting {coin} balance: {e}")
         return 0.0
+
 
 def convert_coins(fromCoin, toCoin, accountType, usd_amount, session):
     """
@@ -109,24 +100,70 @@ def convert_coins(fromCoin, toCoin, accountType, usd_amount, session):
         send_telegram(error_msg)
         return (fromCoin, toCoin, "0.0", "0.0") 
 
-def log_trade(symbol, quantity, price, total_usd):
-    """Logs the executed trade details to the CSV file."""
-    trade_data = {
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'symbol': symbol, 'quantity': quantity, 'price': price, 'total_usd': total_usd
-    }
 
-    df = pd.DataFrame([trade_data])
-    if not os.path.exists(LOG_FILE):
-        df.to_csv(LOG_FILE, index=False)
+def log_trade(symbol, quantity, price, total_usd):
+    """Logs the trade details into the 'trade_log' table."""
+
+    table_url = os.getenv('TABLE_URL')
+    table_key = os.getenv('TABLE_PASSWORD')
+    supabase_client = create_client(table_url, table_key)
+    trade_id = f"{symbol}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    
+    data = {
+        'trade_id': trade_id,
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'symbol': symbol,
+        'quantity': quantity,
+        'price': price,
+        'total_usd': total_usd
+    }
+    supabase_client.table('trade_log').insert(data).execute()
+    
+
+def calculate_PnL(session, from_date=None, to_date=None):
+    table_url = os.getenv('TABLE_URL')
+    table_key = os.getenv('TABLE_PASSWORD')
+    supabase_client = create_client(table_url, table_key)
+    
+    data = supabase_client.table('trade_log').select('*').execute()
+    trades = pd.DataFrame(data.data)
+    trades['timestamp'] = pd.to_datetime(trades['timestamp'])
+    trades['symbol'] = trades['symbol'].apply(lambda x: x.replace('USDT', '').replace('USDC', ''))
+    
+    if trades['price'].isnull().any():
+        trades['price'] = trades['price'].fillna(trades['total_usd'] / trades['quantity'])
+
+    if from_date:
+        trades = trades[trades['timestamp'] >= pd.to_datetime(from_date)]
     else:
-        df.to_csv(LOG_FILE, mode='a', header=False, index=False)
+        from_date = trades['timestamp'].min().strftime('%Y-%m-%d')
+
+    if to_date:
+        trades = trades[trades['timestamp'] <= pd.to_datetime(to_date)]
+    else:
+        to_date = datetime.now().strftime('%Y-%m-%d')
+    
+    for symbol in trades['symbol'].unique():
+        symbol_trades = trades[trades['symbol'] == symbol]
+        total_invested = trades.loc[trades['symbol'] == symbol, 'total_usd'].sum()
+        total_quantity = symbol_trades['quantity'].sum()
+        current_symbol_price = float(session.get_tickers(category='spot', symbol=f'{symbol}USDT')['result']['list'][0]['lastPrice'])
+        current_value = total_quantity * current_symbol_price
+        pnl = current_value - total_invested
+        status_emoji = "🟢" if pnl >= 0 else "🔴"
+
+        logger.info(f"PnL for {symbol} from {from_date} to {to_date}: Invested ${total_invested:.2f}, Current Value ${current_value:.2f}, PnL ${pnl:.2f}")
+        send_telegram(f"📊 PnL for {symbol} from {from_date} to {to_date}:\n"
+                      f"   Invested: ${total_invested:.2f}\n"
+                      f"   Current Value: ${current_value:.2f}\n"
+                      f"{status_emoji}PnL: ${pnl:.2f}")
+
 
 def stake_or_redeem(session, category, order_type, account_type, amount, coin):
     """Performs staking or redemption using the Bybit Earn API."""
-    
-    # round to 6 decimal places 
-    rounded_amount = round(amount, 6) 
+
+    # round to 4 decimal places 
+    rounded_amount = round(amount, 4) 
     
     productIdInfo = session.get_earn_product_info(category=category, coin=coin)
     if not productIdInfo['result']['list']:
@@ -155,6 +192,7 @@ def stake_or_redeem(session, category, order_type, account_type, amount, coin):
         logger.error(f"Error during stake/redeem: {e}")
         send_telegram(f"❌ Error during stake/redeem: {e}")
         return False
+
 
 def get_crypto_allocation():
     """Reads and parses the crypto allocation strategy from the .env file."""
@@ -322,7 +360,6 @@ def run_dca_bot(session):
     
     # --- 5. Core DCA logic: buying ---
     for symbol, multiplier in crypto_allocation.items():
-        # ... (buying logic remains the same)
         buy_amount_usd = multiplier * DAILY_USD
         
         if final_coin_balance < buy_amount_usd:
@@ -352,10 +389,8 @@ def run_dca_bot(session):
             
             final_coin_balance -= float(order[2]) 
         
-        # --- 6. Auto-staking/Liquidity adding logic ---
-        # Note: This step is now separate from the deficit covering logic.
         coin_balance = get_coin_balance(session, symbol, account_type='UNIFIED')
-        if symbol == 'SOL' and coin_balance >= 0.1:
+        if symbol == 'SOL' and coin_balance >= 0.15:
             logger.info(f"Trying to stake {coin_balance} {symbol} to OnChain Earn...")
             stake_or_redeem(
                 session,
@@ -370,6 +405,7 @@ def run_dca_bot(session):
                 f"❗ACTION REQUIRED: Manually add {coin_balance:.6f} {symbol} to Mining Liquidity."
             )
 
+
 def daily_dca():
     """Initializes the session and runs the main DCA bot."""
     if not API_KEY or not API_SECRET:
@@ -382,6 +418,7 @@ def daily_dca():
         testnet=False    # True for testnet
     )
     run_dca_bot(session)
+    calculate_PnL(session, from_date=os.getenv('PNL_FROM_DATE'))
 
 
 # === Start ===

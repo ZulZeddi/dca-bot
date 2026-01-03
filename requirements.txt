@@ -5,3 +5,4 @@ binance-connector
 python-dotenv
 pybit
 loguru
+supabase
