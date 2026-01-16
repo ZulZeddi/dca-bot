@@ -61,6 +61,7 @@ def get_coin_balance(session, coin, account_type='UNIFIED'):
         return 0.0 
     except Exception as e:
         logger.error(f"Error getting {coin} balance: {e}")
+        send_telegram(f"❌ Error getting {coin} balance: {e}")
         return 0.0
 
 def convert_coins(fromCoin, toCoin, accountType, usd_amount, session):
@@ -79,15 +80,18 @@ def convert_coins(fromCoin, toCoin, accountType, usd_amount, session):
         
         res = request_a_quote['result']
         logger.info(f"Converted {res['fromAmount']} {res['fromCoin']} to {res['toAmount']} {res['toCoin']}")
+        send_telegram(f"✅ Converted {res['fromAmount']} {res['fromCoin']} to {res['toAmount']} {res['toCoin']}")
         return (res['fromCoin'], res['toCoin'], res['fromAmount'], res['toAmount'])
     except Exception as e:
         logger.error(f"Conversion error: {e}")
+        send_telegram(f"❌ Conversion error: {e}")
         return (fromCoin, toCoin, "0.0", "0.0") 
 
 def log_trade(symbol, quantity, price, total_usd):
     """Logs the trade details into Supabase."""
     if not supabase_client:
         logger.error("Supabase client not initialized. Cannot log trade.")
+        send_telegram("❌ Supabase client not initialized. Trade logging failed.")
         return
     try:
         data = {
@@ -101,11 +105,13 @@ def log_trade(symbol, quantity, price, total_usd):
         supabase_client.table('trade_log').insert(data).execute()
     except Exception as e:
         logger.error(f"Supabase logging error: {e}")
+        send_telegram(f"❌ Supabase logging error: {e}")
 
 def calculate_PnL(session, from_date=None, to_date=None):
     """Calculates PnL comparing Supabase spend vs current market value with date filtering."""
     if not supabase_client:
         logger.error("Supabase client not initialized. Cannot calculate PnL.")
+        send_telegram("❌ Supabase client not initialized. PnL calculation failed.")
         return
     try:
         data_response = supabase_client.table('trade_log').select('*').execute()
@@ -133,6 +139,7 @@ def calculate_PnL(session, from_date=None, to_date=None):
         
         if trades.empty:
             logger.info(f"No trades found for period {from_date} to {to_date}")
+            send_telegram(f"ℹ️ No trades found from {from_date} to {to_date} for PnL calculation.")
             return
 
         for symbol in trades['symbol'].unique():
@@ -143,7 +150,7 @@ def calculate_PnL(session, from_date=None, to_date=None):
             total_quantity = symbol_trades['quantity'].sum()
             
             # Fetch current market price
-            ticker = session.get_tickers(category='spot', symbol=symbol)
+            ticker = session.get_tickers(category='spot', symbol=f"{symbol}{USD_TYPE}")
             if not ticker['result']['list']:
                 continue
             
@@ -162,6 +169,7 @@ def calculate_PnL(session, from_date=None, to_date=None):
             
     except Exception as e:
         logger.error(f"PnL calculation error: {e}")
+        send_telegram(f"❌ PnL calculation error: {e}")
 
 def stake_or_redeem(session, category, order_type, account_type, amount, coin):
     """Handles Staking/Redemption logic."""
@@ -178,10 +186,12 @@ def stake_or_redeem(session, category, order_type, account_type, amount, coin):
         )
         if res and res['retCode'] == 0:
             logger.info(f"{order_type} {rounded_amount} {coin} success.")
+            send_telegram(f"✅ {order_type} {rounded_amount} {coin} success.")
             return True
         return False
     except Exception as e:
         logger.error(f"Stake/Redeem error: {e}")
+        send_telegram(f"❌ Stake/Redeem error: {e}")
         return False
 
 def get_crypto_allocation():
@@ -203,6 +213,7 @@ def run_dca_bot(session):
     allocation = get_crypto_allocation()
     if not allocation: 
         logger.error("No allocation found in CRYPTO_ALLOCATION_STRING.")
+        send_telegram("❌ No allocation found. DCA aborted.")
         return 
     
     total_needed = sum(allocation.values()) * DAILY_USD
@@ -211,6 +222,7 @@ def run_dca_bot(session):
     if current_bal < total_needed:
         deficit = total_needed - current_bal
         logger.info(f"Deficit of {deficit:.2f} {USD_TYPE}. Checking Flexible Saving...")
+        send_telegram(f"⚠️ Insufficient {USD_TYPE} balance. Attempting to redeem {deficit:.2f} {USD_TYPE} from Flexible Saving.")
         
         staked = session.get_staked_position(category='FlexibleSaving', coin=USD_TYPE)
         if staked['result']['list']:
@@ -220,6 +232,7 @@ def run_dca_bot(session):
             if redeemable > 0:
                 to_redeem = min(redeemable, max(deficit * BUFFER_MULTIPLIER, MIN_REDEMPTION_USD))
                 logger.info(f"Redeeming {to_redeem:.2f} {USD_TYPE}...")
+                send_telegram(f"🔄 Redeeming {to_redeem:.2f} {USD_TYPE} from Flexible Saving.")
                 if stake_or_redeem(session, 'FlexibleSaving', 'Redeem', 'UNIFIED', to_redeem, USD_TYPE):
                     time.sleep(5)
                     current_bal = get_coin_balance(session, USD_TYPE)
@@ -233,6 +246,7 @@ def run_dca_bot(session):
     for coin, multiplier in allocation.items():
         buy_usd = multiplier * DAILY_USD
         logger.info(f"Buying {coin} with {buy_usd:.2f} {USD_TYPE}")
+        send_telegram(f"💰 Buying {coin} with {buy_usd:.2f} {USD_TYPE}")
         
         order = convert_coins(USD_TYPE, coin, 'eb_convert_uta', buy_usd, session)
         
