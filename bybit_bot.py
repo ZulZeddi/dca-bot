@@ -228,6 +228,7 @@ def run_dca_bot(session):
         if staked['result']['list']:
             pos = staked['result']['list'][0]
             redeemable = float(pos.get('redeemableAmount') or pos.get('amount', 0))
+            send_telegram(f"ℹ️ Flexible Saving redeemable amount: {redeemable:.2f} {USD_TYPE}.")
             
             if redeemable > 0:
                 to_redeem = min(redeemable, max(deficit * BUFFER_MULTIPLIER, MIN_REDEMPTION_USD))
