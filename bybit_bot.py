@@ -1,6 +1,8 @@
 import os
 import sys
+import json
 import uuid
+from pathlib import Path
 from pybit.unified_trading import HTTP
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
@@ -11,12 +13,21 @@ from loguru import logger
 from supabase import create_client
 import pandas as pd
 
+# Absolute paths throughout: a scheduled run's working directory is not the
+# script directory, so a relative .env or log path resolves somewhere else
+# (under Task Scheduler, C:\Windows\System32) and fails silently.
+BASE_DIR = Path(__file__).resolve().parent
+LOG_DIR = BASE_DIR / 'log'
+LOG_DIR.mkdir(exist_ok=True)
+
 logger.remove()
 logger.add(sys.stderr, level="INFO", colorize=True,
            format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>")
+logger.add(LOG_DIR / "dca_bot_{time:YYYY-MM-DD}.log", level="DEBUG",
+           rotation="1 day", retention="90 days", enqueue=True)
 
 # === Settings ===
-load_dotenv()
+load_dotenv(BASE_DIR / '.env')
 API_KEY = os.getenv('API_KEY')
 API_SECRET = os.getenv('API_SECRET')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -45,13 +56,16 @@ TESTNET = os.getenv('TESTNET', 'false').lower() == 'true'
 # multipliers, or a config typo. Default = 3x the nominal daily budget. Set an
 # explicit absolute value if your allocation weights do not sum to ~1.
 MAX_SPEND_PER_RUN = float(os.getenv('MAX_SPEND_PER_RUN', max(DAILY_USD * 3.0, 1.0)))
-# Cap on the product of all per-coin buy multipliers (VA × market boost × rebalance).
+# Cap on the product of all per-coin buy multipliers (market boost × rebalance).
 MAX_COMBINED_MULTIPLIER = float(os.getenv('MAX_COMBINED_MULTIPLIER', 3.0))
 # Minimum residual (USD) worth routing through Convert after a partial spot fill.
 MIN_CONVERT_USD = float(os.getenv('MIN_CONVERT_USD', 1.0))
 # Run-lock to stop a duplicate/concurrent invocation from double-spending.
-LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dca_bot.lock')
-LOCK_STALE_SECONDS = int(os.getenv('LOCK_STALE_SECONDS', 1800))
+LOCK_PATH = str(BASE_DIR / 'dca_bot.lock')
+# Dry-run trades go to a local file, never to the production ledger.
+DRYRUN_TRADES_PATH = LOG_DIR / 'dryrun_trades.jsonl'
+# Local idempotency record — checked before the remote ledger.
+LAST_RUN_PATH = LOG_DIR / 'last_run.json'
 
 
 # ─── Utilities ────────────────────────────────────────────────────────────────
@@ -85,7 +99,12 @@ def get_coin_balance(session, coin, account_type='UNIFIED'):
 
 
 def get_staked_balance(session, coin, category):
-    """Returns staked/earn balance for coin in the given Earn category, 0.0 on error."""
+    """
+    Returns staked/earn balance for coin in the given Earn category, or None on
+    API error. None must NOT be reported as 0.0: stake_idle_coin() parks almost
+    the whole position in Earn, so a failed read that reads as zero makes an
+    owned coin look unbought and the bot over-buys it.
+    """
     try:
         pos = session.get_staked_position(category=category, coin=coin)
         total = 0.0
@@ -95,59 +114,111 @@ def get_staked_balance(session, coin, category):
         return total
     except Exception as e:
         logger.error(f"Error getting staked {coin} ({category}) balance: {e}")
-        return 0.0
+        return None
 
 
 def get_total_coin_holdings(session, coin):
     """
     Total holdings = liquid spot wallet balance + staked balance in the coin's
-    configured Earn category. Returns None on spot-read API error (so callers can
-    tell an API failure apart from a genuine zero), else the summed float.
+    configured Earn category. Returns None if EITHER read fails, so callers can
+    tell an API failure apart from a genuine zero.
 
-    Balance-driven SIZING (portfolio weights, value averaging, rebalancing) must
-    use this, NOT get_coin_balance(): stake_idle_coin() parks bought coins in
-    Earn, so a spot-only read makes them look unbought and the bot over-buys
-    them every run.
+    Balance-driven SIZING (portfolio weights, rebalancing) must use this, NOT
+    get_coin_balance(): stake_idle_coin() parks bought coins in Earn, so a
+    spot-only read makes them look unbought and the bot over-buys them.
     """
     spot = get_coin_balance(session, coin)
     if spot is None:
         return None
     cfg = get_stake_config().get(coin.upper())
-    staked = get_staked_balance(session, coin, cfg['category']) if cfg else 0.0
+    if not cfg:
+        return round(spot, 8)
+    staked = get_staked_balance(session, coin, cfg['category'])
+    if staked is None:
+        return None
     return round(spot + staked, 8)
 
 
-def get_current_price(session, coin):
-    # Try the configured stablecoin pair first; fall back to the USDT pair as a
-    # ~$1-parity price reference so a coin without a {coin}{USD_TYPE} spot pair
-    # (e.g. TONUSDC) is still priced for guards/VA and can be bought via Convert.
+_SYMBOL_CACHE = {}
+
+
+def resolve_symbol(session, coin):
+    """
+    Returns the market-data symbol for `coin`: the configured stablecoin pair if
+    it exists, else the USDT pair as a ~$1-parity reference. Returns None if
+    neither exists.
+
+    Every price/kline consumer must resolve through here. Hardcoding
+    f"{coin}{USD_TYPE}" is how the flash-crash breaker and Bollinger signal
+    silently died for TON, which has no TONUSDC pair — the kline call errored
+    and both fell back to "no signal" while looking healthy.
+
+    Note this is for MARKET DATA only. A spot buy order must still be placed on
+    the {coin}{USD_TYPE} pair, because that is the coin being spent.
+    """
+    if coin in _SYMBOL_CACHE:
+        return _SYMBOL_CACHE[coin]
+
+    resolved = None
     for quote in dict.fromkeys((USD_TYPE, 'USDT')):
+        symbol = f"{coin}{quote}"
         try:
-            ticker = session.get_tickers(category='spot', symbol=f"{coin}{quote}")
+            ticker = session.get_tickers(category='spot', symbol=symbol)
             if ticker['result']['list']:
-                price = float(ticker['result']['list'][0]['lastPrice'])
+                resolved = symbol
                 if quote != USD_TYPE:
-                    logger.warning(f"{coin}{USD_TYPE} unavailable — using {coin}{quote} as price reference")
-                return price
+                    logger.warning(f"{coin}{USD_TYPE} unavailable — using {symbol} for market data.")
+                break
         except Exception as e:
-            logger.error(f"Error getting price for {coin}{quote}: {e}")
+            logger.error(f"Symbol lookup failed for {symbol}: {e}")
+
+    _SYMBOL_CACHE[coin] = resolved
+    return resolved
+
+
+def get_current_price(session, coin):
+    symbol = resolve_symbol(session, coin)
+    if not symbol:
+        logger.error(f"No tradable market-data pair for {coin}.")
+        return None
+    try:
+        ticker = session.get_tickers(category='spot', symbol=symbol)
+        if ticker['result']['list']:
+            return float(ticker['result']['list'][0]['lastPrice'])
+    except Exception as e:
+        logger.error(f"Error getting price for {symbol}: {e}")
     return None
 
 
 def log_trade(symbol, quantity, price, total_usd):
+    now = datetime.now(timezone.utc)
+    data = {
+        'trade_id': f"{symbol}-{now.strftime('%Y%m%d%H%M%S%f')}",
+        'timestamp': now.strftime('%Y-%m-%d %H:%M:%S'),
+        'symbol': symbol,
+        'quantity': float(quantity),
+        'price': float(price),
+        'total_usd': float(total_usd),
+    }
+
+    # A simulated fill must NEVER reach the production ledger. Convert returns
+    # real quote amounts in DRY_RUN, so without this guard a dry run writes a
+    # fabricated trade that then corrupts PnL and makes the idempotency check
+    # skip the real live run.
+    if DRY_RUN:
+        try:
+            with open(DRYRUN_TRADES_PATH, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(data) + '\n')
+        except Exception as e:
+            logger.error(f"Dry-run trade log error: {e}")
+        logger.info(f"[DRY RUN] Trade not persisted to ledger: {symbol} qty={quantity} ${total_usd}")
+        return
+
     if not supabase_client:
-        logger.error("Supabase not initialized. Trade not logged.")
+        logger.error("Supabase not initialized. Trade NOT logged — ledger is now incomplete.")
+        send_telegram(f"❌ Trade executed but NOT logged (no Supabase): {symbol} ${total_usd}")
         return
     try:
-        now = datetime.now(timezone.utc)
-        data = {
-            'trade_id': f"{symbol}-{now.strftime('%Y%m%d%H%M%S%f')}",
-            'timestamp': now.strftime('%Y-%m-%d %H:%M:%S'),
-            'symbol': symbol,
-            'quantity': float(quantity),
-            'price': float(price),
-            'total_usd': float(total_usd),
-        }
         supabase_client.table('trade_log').insert(data).execute()
     except Exception as e:
         logger.error(f"Supabase logging error: {e}")
@@ -156,55 +227,127 @@ def log_trade(symbol, quantity, price, total_usd):
 
 # ─── Idempotency / run safety ──────────────────────────────────────────────────
 
+_LOCK_HANDLE = None
+
+
 def acquire_run_lock():
     """
-    Atomically create a lock file so a duplicate/concurrent invocation cannot
-    double-spend. Returns True if acquired. A stale lock (older than
-    LOCK_STALE_SECONDS, left by a crashed run) is stolen.
+    Take an OS-level advisory lock held for the lifetime of the process.
+    The OS drops it on any exit — clean, crashed, or killed — so there is no
+    stale lock to age out and no steal race to get wrong.
     """
+    global _LOCK_HANDLE
     try:
-        try:
-            fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            age = time.time() - os.path.getmtime(LOCK_PATH)
-            if age < LOCK_STALE_SECONDS:
-                logger.error(f"Another run holds the lock (age {age:.0f}s). Aborting.")
-                send_telegram("⛔ DCA skipped: another run already in progress (lock held).")
-                return False
-            logger.warning(f"Stale lock ({age:.0f}s old) — stealing it.")
-            os.remove(LOCK_PATH)
-            fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, f"{os.getpid()} {datetime.now(timezone.utc).isoformat()}".encode())
-        os.close(fd)
-        return True
+        handle = open(LOCK_PATH, 'a+')
     except Exception as e:
-        logger.error(f"Lock acquire error: {e}")
+        logger.error(f"Lock file error: {e}")
+        send_telegram(f"❌ DCA aborted: cannot open run lock: {e}")
         return False
+
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        logger.error("Another run holds the lock. Aborting.")
+        send_telegram("⛔ DCA skipped: another run already in progress.")
+        return False
+    except Exception as e:
+        handle.close()
+        logger.error(f"Lock acquire error: {e}")
+        send_telegram(f"❌ DCA aborted: cannot acquire run lock: {e}")
+        return False
+
+    _LOCK_HANDLE = handle
+    logger.debug(f"Run lock acquired (pid {os.getpid()}).")
+    return True
 
 
 def release_run_lock():
+    global _LOCK_HANDLE
+    if _LOCK_HANDLE is None:
+        return
     try:
-        if os.path.exists(LOCK_PATH):
-            os.remove(LOCK_PATH)
+        if os.name == 'nt':
+            import msvcrt
+            _LOCK_HANDLE.seek(0)
+            msvcrt.locking(_LOCK_HANDLE.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(_LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
     except Exception as e:
         logger.error(f"Lock release error: {e}")
+    finally:
+        try:
+            _LOCK_HANDLE.close()
+        except Exception:
+            pass
+        _LOCK_HANDLE = None
 
 
-def already_traded_today(session):
-    """True if a trade is already logged for the current UTC date (idempotency)."""
-    if not supabase_client:
-        return False
+def _read_last_run():
     try:
-        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-        resp = (supabase_client.table('trade_log')
-                .select('trade_id')
-                .gte('timestamp', f"{today} 00:00:00")
-                .limit(1)
-                .execute())
-        return bool(resp.data)
+        if LAST_RUN_PATH.exists():
+            return json.loads(LAST_RUN_PATH.read_text(encoding='utf-8'))
     except Exception as e:
-        logger.error(f"already_traded_today check error: {e}")
-        return False
+        logger.error(f"last_run read error: {e}")
+    return {}
+
+
+def record_local_buy(coin):
+    """Record locally, immediately, that `coin` was bought today (UTC)."""
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    data = _read_last_run()
+    if data.get('date') != today:
+        data = {'date': today, 'coins': []}
+    if coin not in data.get('coins', []):
+        data.setdefault('coins', []).append(coin)
+    try:
+        LAST_RUN_PATH.write_text(json.dumps(data), encoding='utf-8')
+    except Exception as e:
+        logger.error(f"last_run write error: {e}")
+
+
+def coins_bought_today(allocation):
+    """
+    Returns the set of coins already bought today (UTC), or None if that cannot
+    be established.
+
+    Checks the local record first — the real duplicate-run threat is a repeated
+    local invocation, and a local file catches it with no network round-trip —
+    then the remote ledger. Returning None on a ledger error lets the caller
+    FAIL CLOSED: an idempotency gate that errors toward "trade again" is worse
+    than no gate at all.
+    """
+    now = datetime.now(timezone.utc)
+    today = now.strftime('%Y-%m-%d')
+    tomorrow = (now + timedelta(days=1)).strftime('%Y-%m-%d')
+
+    bought = set()
+    local = _read_last_run()
+    if local.get('date') == today:
+        bought.update(local.get('coins', []))
+
+    if not supabase_client:
+        return bought
+
+    try:
+        resp = (supabase_client.table('trade_log')
+                .select('symbol')
+                .gte('timestamp', f"{today} 00:00:00")
+                .lt('timestamp', f"{tomorrow} 00:00:00")
+                .execute())
+        symbols = {(row.get('symbol') or '') for row in (resp.data or [])}
+        bought.update(c for c in allocation if f"{c}{USD_TYPE}" in symbols)
+        return bought
+    except Exception as e:
+        logger.error(f"Idempotency check failed: {e}")
+        return None
 
 
 # ─── Market Signals ────────────────────────────────────────────────────────────
@@ -228,10 +371,13 @@ def get_bollinger_signal(session, coin, current_price, period=20):
     Returns 1.0 (price below lower Bollinger Band — buy signal),
     -1.0 (above upper band — overbought), or 0.0 (inside bands).
     """
+    symbol = resolve_symbol(session, coin)
+    if not symbol:
+        return 0.0
     try:
         klines = session.get_kline(
             category='spot',
-            symbol=f'{coin}{USD_TYPE}',
+            symbol=symbol,
             interval='D',
             limit=period + 2,
         )
@@ -289,24 +435,36 @@ def get_market_boost(session, coin, current_price, fng_value):
 
 
 def is_flash_crash(session, coin, current_price):
-    """Returns True if price dropped more than FLASH_CRASH_PCT% in last FLASH_CRASH_HOURS hours."""
+    """
+    Returns True if price is more than FLASH_CRASH_PCT% below its highest point
+    in the last FLASH_CRASH_HOURS hours.
+
+    Measured peak-to-current, not oldest-open-to-current: a V-shaped crash that
+    has partly recovered is invisible to an open-vs-last comparison, which is
+    exactly the move worth skipping. `limit=hours+1` covers `hours` completed
+    candles plus the one in progress.
+    """
     pct_threshold = float(os.getenv('FLASH_CRASH_PCT', 25))
-    hours = int(os.getenv('FLASH_CRASH_HOURS', 1))
+    hours = max(1, int(os.getenv('FLASH_CRASH_HOURS', 1)))
+    symbol = resolve_symbol(session, coin)
+    if not symbol:
+        return False
     try:
         klines = session.get_kline(
             category='spot',
-            symbol=f'{coin}{USD_TYPE}',
+            symbol=symbol,
             interval='60',
-            limit=hours + 2,
+            limit=hours + 1,
         )
-        if not klines['result']['list'] or len(klines['result']['list']) < 2:
+        rows = klines['result']['list']
+        if not rows:
             return False
-        oldest_open = float(klines['result']['list'][-1][1])
-        if oldest_open == 0:
+        peak = max(float(r[2]) for r in rows)  # highest high in the window
+        if peak <= 0:
             return False
-        drop_pct = (oldest_open - current_price) / oldest_open * 100
+        drop_pct = (peak - current_price) / peak * 100
         if drop_pct >= pct_threshold:
-            msg = f"⚡ Flash crash: {coin} -{drop_pct:.1f}% in {hours}h. Skipping buy."
+            msg = f"⚡ Flash crash: {coin} -{drop_pct:.1f}% from {hours}h high. Skipping buy."
             logger.warning(msg)
             send_telegram(msg)
             return True
@@ -480,13 +638,19 @@ def execute_buy(session, coin, usd_amount):
     A partial spot fill is KEPT and only the unfilled residual is bought via
     Convert (no double-spend). Returns aggregated (fromCoin, toCoin, usd, qty).
     """
+    # Always return a 4-tuple of strings — the caller parses order[2]/order[3]
+    # unconditionally, so any None here is a TypeError mid-run.
+    if usd_amount <= 0:
+        return (USD_TYPE, coin, "0.0", "0.0")
+
     spot_val, spot_qty = 0.0, 0.0
     if os.getenv('USE_SPOT_ORDERS', 'false').lower() == 'true':
         result = try_spot_limit_order(session, coin, usd_amount)
         if result:
             spot_val, spot_qty = float(result[2]), float(result[3])
         if spot_val >= usd_amount * 0.99:
-            return result  # effectively fully filled on the maker order
+            # Effectively fully filled on the maker order.
+            return (USD_TYPE, coin, str(spot_val), str(spot_qty))
         if spot_val > 0:
             logger.info(f"Spot partial ${spot_val:.2f}/{usd_amount:.2f} for {coin} — converting residual.")
         else:
@@ -598,36 +762,50 @@ def stake_idle_coin(session, coin):
 
 def ensure_stablecoin_balance(session, total_needed):
     """
-    Ensures sufficient stablecoin in spot wallet, redeeming from Flexible Saving if needed.
-    Polls for up to 30s after redemption to let funds settle.
+    Ensures sufficient stablecoin in the spot wallet, redeeming from Flexible
+    Saving if needed. Polls for up to 30s after redemption to let funds settle.
+
+    Returns the available balance, or None if it cannot be read. A read failure
+    must never be mistaken for "no money" — that would redeem funds out of yield
+    on the strength of a network blip.
     """
-    current_bal = get_coin_balance(session, USD_TYPE) or 0.0
+    current_bal = get_coin_balance(session, USD_TYPE)
+    if current_bal is None:
+        logger.error(f"Cannot read {USD_TYPE} balance — not redeeming.")
+        return None
     if current_bal >= total_needed:
         return current_bal
 
     deficit = total_needed - current_bal
     logger.info(f"Deficit {deficit:.2f} {USD_TYPE}. Checking Flexible Saving...")
-    send_telegram(f"⚠️ Low {USD_TYPE} balance. Redeeming {deficit:.2f} from Flexible Saving.")
 
+    if DRY_RUN:
+        logger.info(f"[DRY RUN] Would redeem ~{deficit:.2f} {USD_TYPE} from Flexible Saving.")
+        return current_bal
+
+    send_telegram(f"⚠️ Low {USD_TYPE} balance. Redeeming {deficit:.2f} from Flexible Saving.")
     try:
         staked = session.get_staked_position(category='FlexibleSaving', coin=USD_TYPE)
         if staked['result']['list']:
             pos = staked['result']['list'][0]
             redeemable = float(pos.get('redeemableAmount') or pos.get('amount', 0))
-            send_telegram(f"ℹ️ Redeemable: {redeemable:.2f} {USD_TYPE}")
+            logger.info(f"Redeemable: {redeemable:.2f} {USD_TYPE}")
             if redeemable > 0:
                 to_redeem = min(redeemable, max(deficit * BUFFER_MULTIPLIER, MIN_REDEMPTION_USD))
-                send_telegram(f"🔄 Redeeming {to_redeem:.2f} {USD_TYPE}")
                 if stake_or_redeem(session, 'FlexibleSaving', 'Redeem', 'UNIFIED', to_redeem, USD_TYPE):
                     for _ in range(6):
                         time.sleep(5)
-                        new_bal = get_coin_balance(session, USD_TYPE) or 0.0
-                        if new_bal >= total_needed:
+                        new_bal = get_coin_balance(session, USD_TYPE)
+                        if new_bal is not None and new_bal >= total_needed:
                             return new_bal
+            else:
+                logger.warning(f"Nothing redeemable in {USD_TYPE} Flexible Saving.")
     except Exception as e:
         logger.error(f"Redemption error: {e}")
+        send_telegram(f"❌ Redemption error: {e}")
 
-    return get_coin_balance(session, USD_TYPE) or 0.0
+    final = get_coin_balance(session, USD_TYPE)
+    return current_bal if final is None else final
 
 
 def sweep_stablecoin_surplus(session):
@@ -644,50 +822,8 @@ def sweep_stablecoin_surplus(session):
         return
 
     logger.info(f"Sweeping {surplus:.2f} {USD_TYPE} surplus to Flexible Saving (buffer={buffer:.2f})")
-    if stake_or_redeem(session, 'FlexibleSaving', 'Stake', 'UNIFIED', surplus, USD_TYPE):
+    if stake_or_redeem(session, 'FlexibleSaving', 'Stake', 'UNIFIED', surplus, USD_TYPE) and not DRY_RUN:
         send_telegram(f"💰 Swept {surplus:.2f} {USD_TYPE} to Flexible Saving")
-
-
-# ─── Value Averaging ───────────────────────────────────────────────────────────
-
-def get_va_buy_amount(session, coin, base_daily_usd, current_price):
-    """
-    Value Averaging: target portfolio value grows by base_daily_usd per day.
-    Buys more when below trajectory, less when ahead. Always buys at least 10%.
-    """
-    if not supabase_client or not current_price:
-        return base_daily_usd
-    try:
-        symbol = f'{coin}{USD_TYPE}'
-        resp = (supabase_client.table('trade_log')
-                .select('timestamp')
-                .eq('symbol', symbol)
-                .order('timestamp', desc=False)
-                .limit(1)
-                .execute())
-        if not resp.data:
-            return base_daily_usd
-
-        first_date = pd.to_datetime(resp.data[0]['timestamp'])
-        if hasattr(first_date, 'tzinfo') and first_date.tzinfo:
-            first_date = first_date.tz_convert('UTC').tz_localize(None)
-        days_elapsed = max(1, (datetime.now(timezone.utc).replace(tzinfo=None) - first_date).days)
-
-        target_value = days_elapsed * base_daily_usd
-        current_qty = get_total_coin_holdings(session, coin) or 0.0  # incl. staked
-        current_value = current_qty * current_price
-
-        va_buy = target_value - current_value
-        max_buy = base_daily_usd * float(os.getenv('VA_MAX_MULTIPLIER', 3.0))
-        min_buy = base_daily_usd * 0.1
-        result = max(min_buy, min(va_buy, max_buy))
-
-        if abs(result - base_daily_usd) > base_daily_usd * 0.15:
-            logger.info(f"VA {coin}: target=${target_value:.2f} current=${current_value:.2f} → buy=${result:.2f}")
-        return result
-    except Exception as e:
-        logger.error(f"Value averaging error for {coin}: {e}")
-        return base_daily_usd
 
 
 # ─── Portfolio ─────────────────────────────────────────────────────────────────
@@ -740,12 +876,16 @@ def validate_trading_pairs(session, allocation):
 
 
 def get_portfolio_weights(session, allocation):
+    """
+    Per-coin portfolio value (spot + staked). A coin whose price or balance
+    could not be read maps to None — NOT omitted and not zero, so the caller can
+    tell "I own none of this" apart from "I could not find out".
+    """
     portfolio = {}
     for coin in allocation:
         price = get_current_price(session, coin)
         bal = get_total_coin_holdings(session, coin)  # spot + staked, else weights are wrong
-        if price and bal is not None:
-            portfolio[coin] = bal * price
+        portfolio[coin] = bal * price if (price and bal is not None) else None
     return portfolio
 
 
@@ -753,6 +893,15 @@ def get_buy_rebalance_multipliers(allocation, portfolio):
     """Returns per-coin buy-side multipliers when a coin is underweight."""
     threshold = float(os.getenv('REBALANCE_THRESHOLD', 5))
     boost = float(os.getenv('REBALANCE_MULTIPLIER', 1.5))
+
+    # An incomplete portfolio makes every weight wrong: the unreadable coin
+    # looks like zero holdings (→ spurious boost) and inflates every other
+    # coin's weight. Apply no rebalancing at all rather than a wrong one.
+    if any(v is None for v in portfolio.values()):
+        unreadable = [c for c, v in portfolio.items() if v is None]
+        logger.warning(f"Portfolio incomplete ({', '.join(unreadable)}) — skipping buy-rebalance this run.")
+        return {coin: 1.0 for coin in allocation}
+
     total_value = sum(portfolio.values())
     if total_value == 0:
         return {coin: 1.0 for coin in allocation}
@@ -770,65 +919,6 @@ def get_buy_rebalance_multipliers(allocation, portfolio):
         else:
             multipliers[coin] = 1.0
     return multipliers
-
-
-def do_sell_rebalance(session, allocation):
-    """Sells overweight coins back to stablecoin. Enabled via REBALANCE_SELL=true."""
-    threshold = float(os.getenv('REBALANCE_THRESHOLD', 5))
-    portfolio = get_portfolio_weights(session, allocation)
-    total_value = sum(portfolio.values())
-    if total_value == 0:
-        return
-
-    total_alloc = sum(allocation.values())
-    for coin, mult in allocation.items():
-        target_w = mult / total_alloc
-        current_w = portfolio.get(coin, 0) / total_value
-        drift = (current_w - target_w) * 100
-        if drift <= threshold:
-            continue
-
-        excess_value = (current_w - target_w) * total_value
-        current_price = get_current_price(session, coin)
-        if not current_price:
-            continue
-
-        symbol = f'{coin}{USD_TYPE}'
-        try:
-            inst = session.get_instruments_info(category='spot', symbol=symbol)
-            if not inst['result']['list']:
-                continue
-            lot = inst['result']['list'][0]['lotSizeFilter']
-            qty_step = float(lot['qtyStep'])
-            min_qty = float(lot['minOrderQty'])
-
-            excess_qty = excess_value / current_price
-            sell_qty = round((excess_qty // qty_step) * qty_step, 8)
-            # Can only sell what's liquid in spot — the rest is staked in Earn.
-            liquid = get_coin_balance(session, coin) or 0.0
-            sell_qty = min(sell_qty, round((liquid // qty_step) * qty_step, 8))
-            if sell_qty < min_qty:
-                continue
-
-            msg = f"⚖️ Sell-rebalance: {coin} overweight {drift:.1f}%, selling {sell_qty} {coin} (~${excess_value:.2f})"
-            logger.info(msg)
-            send_telegram(msg)
-
-            if DRY_RUN:
-                logger.info(f"[DRY RUN] Would market-sell {sell_qty} {coin}.")
-                continue
-
-            resp = session.place_order(
-                category='spot', symbol=symbol, side='Sell',
-                orderType='Market', qty=str(sell_qty),
-                orderLinkId=f'rebal-sell-{coin}-{int(time.time() * 1000)}',
-            )
-            if resp and resp.get('retCode') == 0:
-                send_telegram(f"✅ Sold {sell_qty} {coin} for rebalancing")
-            else:
-                logger.error(f"Sell rebalance failed: {resp}")
-        except Exception as e:
-            logger.error(f"Sell rebalance error {coin}: {e}")
 
 
 # ─── PnL ───────────────────────────────────────────────────────────────────────
@@ -903,49 +993,43 @@ def run_dca_bot(session):
         logger.warning("DRY_RUN is ON — no real orders will be placed. Set DRY_RUN=false (or pass --live) to trade.")
         send_telegram("🧪 DRY_RUN mode — simulating, no real orders.")
 
-    # Idempotency: don't repeat today's DCA if a scheduler double-fires.
-    if not DRY_RUN and already_traded_today(session):
-        logger.info("Already traded today (UTC) — skipping to avoid a duplicate DCA.")
-        send_telegram("✅ Already executed today's DCA — skipping duplicate run.")
-        return
-
     allocation = get_crypto_allocation()
     if not allocation:
         logger.error("No allocation in CRYPTO_ALLOCATION_STRING.")
         send_telegram("❌ No allocation found. DCA aborted.")
         return
 
+    # Idempotency, per coin: a run that bought ETH and then died must still be
+    # able to buy SOL and TON. Fail closed — if we cannot establish what was
+    # already bought, skip the run rather than risk a duplicate spend.
+    if not DRY_RUN:
+        bought = coins_bought_today(allocation)
+        if bought is None:
+            logger.error("Cannot verify today's trades (ledger unreachable). Skipping run.")
+            send_telegram("⛔ DCA skipped: cannot verify today's trades (ledger unreachable).")
+            return
+        if bought:
+            allocation = {c: w for c, w in allocation.items() if c not in bought}
+            logger.info(f"Already bought today: {', '.join(sorted(bought))}.")
+            if not allocation:
+                send_telegram("✅ Today's DCA already executed for all coins — skipping.")
+                return
+            send_telegram(f"ℹ️ Already bought today: {', '.join(sorted(bought))}. Buying the remaining coins.")
+
     validate_trading_pairs(session, allocation)
 
-    # Optional: sell overweight coins before buying
-    if os.getenv('REBALANCE_SELL', 'false').lower() == 'true':
-        do_sell_rebalance(session, allocation)
-        time.sleep(3)
-
-    total_needed = sum(allocation.values()) * DAILY_USD
-    logger.info(f"Planned base spend: ${total_needed:.2f} {USD_TYPE} across {len(allocation)} coin(s).")
+    base_spend = sum(allocation.values()) * DAILY_USD
+    logger.info(f"Planned base spend: ${base_spend:.2f} {USD_TYPE} across {len(allocation)} coin(s).")
     # Hard backstop against a DAILY_USD / allocation-weight typo draining Earn.
-    if total_needed > MAX_SPEND_PER_RUN:
-        msg = (f"⛔ Base spend ${total_needed:.2f} exceeds MAX_SPEND_PER_RUN ${MAX_SPEND_PER_RUN:.2f}. "
+    if base_spend > MAX_SPEND_PER_RUN:
+        msg = (f"⛔ Base spend ${base_spend:.2f} exceeds MAX_SPEND_PER_RUN ${MAX_SPEND_PER_RUN:.2f}. "
                f"Check DAILY_USD / allocation weights. DCA aborted.")
         logger.error(msg)
         send_telegram(msg)
         return
 
-    current_bal = ensure_stablecoin_balance(session, total_needed)
-
-    if current_bal < MIN_CONVERT_USD:
-        msg = f"❌ Insufficient {USD_TYPE} ({current_bal:.2f}) — nothing to buy. DCA aborted."
-        logger.error(msg)
-        send_telegram(msg)
-        return
-    if current_bal < total_needed:
-        logger.warning(f"Partial funding {current_bal:.2f}/{total_needed:.2f} {USD_TYPE} — buys scale down.")
-        send_telegram(f"⚠️ Partial funding {current_bal:.2f}/{total_needed:.2f} {USD_TYPE} — scaling buys down.")
-
     max_prices = get_max_prices()
     use_market_boost = os.getenv('USE_MARKET_BOOST', 'true').lower() == 'true'
-    use_value_avg = os.getenv('VALUE_AVERAGING', 'false').lower() == 'true'
 
     fng_value = get_fear_greed_index() if use_market_boost else 50
     portfolio = get_portfolio_weights(session, allocation)
@@ -974,8 +1058,7 @@ def run_dca_bot(session):
             send_telegram(msg)
             continue
 
-        # Value Averaging adjusts the base buy amount
-        buy_usd = get_va_buy_amount(session, coin, base_buy_usd, current_price) if use_value_avg else base_buy_usd
+        buy_usd = base_buy_usd
 
         # Market boost (Fear & Greed + Bollinger)
         if use_market_boost:
@@ -996,7 +1079,7 @@ def run_dca_bot(session):
         sweep_stablecoin_surplus(session)
         return
 
-    # ── Step 2: Cap and scale ──
+    # ── Step 2: Cap, fund, then scale ──
     total_desired = sum(desired_buys.values())
     # Absolute spend ceiling — last line of defence against multiplier runaway.
     if total_desired > MAX_SPEND_PER_RUN:
@@ -1005,14 +1088,31 @@ def run_dca_bot(session):
         send_telegram(f"🛡️ Spend cap hit — scaling buys to ${MAX_SPEND_PER_RUN:.2f}")
         desired_buys = {coin: amt * scale for coin, amt in desired_buys.items()}
         total_desired = MAX_SPEND_PER_RUN
+
+    # Fund AFTER the multipliers are known. Redeeming only the pre-boost base
+    # would leave the boosts unfundable, so they would never actually apply.
+    current_bal = ensure_stablecoin_balance(session, total_desired)
+    if current_bal is None:
+        logger.error("Stablecoin balance unavailable. DCA aborted.")
+        send_telegram("❌ DCA aborted: stablecoin balance unavailable.")
+        return
+    if current_bal < MIN_CONVERT_USD:
+        msg = f"❌ Insufficient {USD_TYPE} ({current_bal:.2f}) — nothing to buy. DCA aborted."
+        logger.error(msg)
+        send_telegram(msg)
+        return
+
     # Scale to available balance (prevents dict-order coins starving later ones).
     if total_desired > current_bal:
         scale = current_bal / total_desired
-        logger.info(f"Budget cap: scaling all buys by {scale:.2%}")
+        logger.warning(f"Partial funding {current_bal:.2f}/{total_desired:.2f} {USD_TYPE} — scaling buys by {scale:.2%}")
+        send_telegram(f"⚠️ Partial funding {current_bal:.2f}/{total_desired:.2f} {USD_TYPE} — scaling buys down.")
         desired_buys = {coin: amt * scale for coin, amt in desired_buys.items()}
 
     # ── Step 3: Execute buys ──
     remaining_bal = current_bal
+    spent_total = 0.0
+    bought_coins = []
 
     for coin, buy_usd in desired_buys.items():
         if remaining_bal < buy_usd * 0.95:
@@ -1022,26 +1122,43 @@ def run_dca_bot(session):
         logger.info(f"Buying {coin}: ${buy_usd:.2f} {USD_TYPE}")
         send_telegram(f"💰 Buying {coin}: ${buy_usd:.2f} {USD_TYPE}")
 
-        order = execute_buy(session, coin, buy_usd)
+        # One coin's failure must not abandon the remaining coins mid-run.
+        try:
+            order = execute_buy(session, coin, buy_usd)
 
-        actual_usd = float(order[2])
-        actual_qty = float(order[3])
-        if actual_qty > 0 and actual_usd > 0:
-            # Decrement only what was actually spent
-            remaining_bal -= actual_usd
+            actual_usd = float(order[2])
+            actual_qty = float(order[3])
+            if actual_qty > 0 and actual_usd > 0:
+                # Decrement only what was actually spent
+                remaining_bal -= actual_usd
+                spent_total += actual_usd
+                bought_coins.append(coin)
 
-            log_trade(
-                symbol=f"{coin}{USD_TYPE}",
-                quantity=actual_qty,
-                price=actual_usd / actual_qty,
-                total_usd=actual_usd,
-            )
+                # Record locally FIRST: if logging or staking then fails, a
+                # re-run must still know this coin was already bought today.
+                record_local_buy(coin)
 
-            # Auto-stake newly accumulated balance
-            stake_idle_coin(session, coin)
+                log_trade(
+                    symbol=f"{coin}{USD_TYPE}",
+                    quantity=actual_qty,
+                    price=actual_usd / actual_qty,
+                    total_usd=actual_usd,
+                )
+
+                # Auto-stake newly accumulated balance
+                stake_idle_coin(session, coin)
+        except Exception as e:
+            logger.exception(f"Buy failed for {coin}: {e}")
+            send_telegram(f"❌ Buy failed for {coin}: {e}")
 
     # ── Step 4: Sweep surplus stablecoin to Flexible Saving ──
     sweep_stablecoin_surplus(session)
+
+    summary = (f"✅ Run complete{' [DRY RUN]' if DRY_RUN else ''}: "
+               f"spent ${spent_total:.2f} {USD_TYPE} on {len(bought_coins)} coin(s)"
+               f"{' — ' + ', '.join(bought_coins) if bought_coins else ''}.")
+    logger.info(summary)
+    send_telegram(summary)
 
     # ── Step 5: PnL report ──
     calculate_PnL(session, from_date=os.getenv('PNL_FROM_DATE'))
@@ -1061,7 +1178,7 @@ def main():
 
     if not API_KEY or not API_SECRET:
         logger.error("API_KEY or API_SECRET missing.")
-        return
+        return 1
 
     session = HTTP(api_key=API_KEY, api_secret=API_SECRET, testnet=TESTNET)
     if TESTNET:
@@ -1069,20 +1186,33 @@ def main():
 
     if args.report:
         send_periodic_report(session, args.report)
-        return
+        return 0
 
     if DAILY_USD <= 0:
         logger.error("DAILY_USD not set or zero. Aborting.")
-        return
+        return 1
 
     # Run-lock guards against duplicate/concurrent invocations double-spending.
     if not acquire_run_lock():
-        return
+        return 1
     try:
         run_dca_bot(session)
+        return 0
     finally:
         release_run_lock()
 
 
 if __name__ == '__main__':
-    main()
+    # A money bot must never die quietly: without this, an unhandled exception
+    # prints a traceback nobody reads and sends no alert at all.
+    try:
+        sys.exit(main() or 0)
+    except SystemExit:
+        raise
+    except BaseException as exc:
+        logger.exception("Unhandled error — run aborted.")
+        try:
+            send_telegram(f"🚨 DCA bot crashed: {type(exc).__name__}: {exc}")
+        except Exception:
+            pass
+        sys.exit(1)

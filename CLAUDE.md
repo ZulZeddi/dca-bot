@@ -27,21 +27,19 @@ There are no tests, linting configs, or build steps — the single entry point i
 
 ## Architecture
 
-Single-file bot (`bybit_bot.py`, ~800 lines). All logic lives in one file; no packages or modules.
+Single-file bot (`bybit_bot.py`, ~1050 lines). All logic lives in one file; no packages or modules.
 
 **Execution flow inside `run_dca_bot()`:**
-1. `do_sell_rebalance()` — optional, sells overweight coins to stablecoin (REBALANCE_SELL=true)
-2. `ensure_stablecoin_balance()` — redeems from Flexible Saving if spot wallet is low
-3. **Step 1:** Pre-compute `desired_buys[coin]` for every coin:
+1. `ensure_stablecoin_balance()` — redeems from Flexible Saving if spot wallet is low
+2. **Step 1:** Pre-compute `desired_buys[coin]` for every coin:
    - `is_flash_crash()` — hourly kline circuit breaker
    - Max price guard via `MAX_PRICE_STRING`
-   - `get_va_buy_amount()` — optional Value Averaging adjustment
    - `get_market_boost()` — Fear & Greed + Bollinger Bands multiplier
    - `get_buy_rebalance_multipliers()` — buy-side boost for underweight coins
-4. **Step 2:** If `sum(desired_buys) > balance`, scale all proportionally (prevents dict-order starvation)
-5. **Step 3:** Execute each buy via `execute_buy()` → `try_spot_limit_order()` (optional) → `convert_coins()` fallback. Decrement `remaining_bal` only after confirmed fill. Then `stake_idle_coin()`.
-6. **Step 4:** `sweep_stablecoin_surplus()` — parks idle stablecoin in Flexible Saving
-7. **Step 5:** `calculate_PnL()` — reads trade_log table from Supabase, sends Telegram report
+3. **Step 2:** Cap at `MAX_SPEND_PER_RUN`, then scale to the available balance (prevents dict-order starvation)
+4. **Step 3:** Execute each buy via `execute_buy()` → `try_spot_limit_order()` (optional) → `convert_coins()` fallback. Decrement `remaining_bal` only after confirmed fill. Then `stake_idle_coin()`.
+5. **Step 4:** `sweep_stablecoin_surplus()` — parks idle stablecoin in Flexible Saving
+6. **Step 5:** `calculate_PnL()` — reads trade_log table from Supabase, sends Telegram report
 
 **Trade execution path:**
 - Default: Bybit Convert API (`request_a_quote` → `confirm_a_quote` → `get_convert_history` for fill verification)
@@ -79,14 +77,11 @@ Optional — safety / live-readiness controls:
 - `MAX_SPEND_PER_RUN` — absolute USD ceiling per run (default `DAILY_USD × 3`). Set explicitly if allocation weights don't sum to ~1.
 - `MAX_COMBINED_MULTIPLIER=3.0` — cap on the product of VA × market-boost × rebalance multipliers
 - `MIN_CONVERT_USD=1.0` — minimum residual routed through Convert after a partial spot fill
-- `LOCK_STALE_SECONDS=1800` — age after which a leftover `dca_bot.lock` is considered stale and stolen
+(The run-lock is an OS-level advisory lock on `dca_bot.lock`; the OS releases it on any exit, so there is no staleness timeout to tune.)
 
 Optional — feature flags (all have safe defaults):
 - `USE_MARKET_BOOST=true` — Fear & Greed + Bollinger boost
 - `DCA_BOOST_MULTIPLIER=2.0` — cap on market boost multiplier
-- `VALUE_AVERAGING=false` — Value Averaging buy sizing
-- `VA_MAX_MULTIPLIER=3.0` — cap on VA multiplier
-- `REBALANCE_SELL=false` — sell-side portfolio rebalancing
 - `REBALANCE_THRESHOLD=5` — drift % that triggers rebalance
 - `REBALANCE_MULTIPLIER=1.5` — buy boost for underweight coins
 - `USE_SPOT_ORDERS=false` — try Post-Only spot limit before Convert
@@ -100,9 +95,14 @@ Optional — feature flags (all have safe defaults):
 
 ## Key Invariants
 
-- `get_coin_balance()` returns `None` (not `0.0`) on API error — always check `if bal is None` separately from zero balance. It reports only the **liquid spot** balance.
-- **Sizing must use `get_total_coin_holdings()` (spot + staked), not `get_coin_balance()`** — `stake_idle_coin()` parks bought coins in Earn, so portfolio weights / value averaging / rebalancing would otherwise treat owned-but-staked coins as unbought and over-buy them every run.
-- `remaining_bal` is decremented using `float(order[2])` (actual USD spent), never the planned amount. `execute_buy()` aggregates a partial spot fill + Convert residual so it never double-spends.
+- **`None` means "could not read", never "zero".** `get_coin_balance()`, `get_staked_balance()`, `get_total_coin_holdings()`, `ensure_stablecoin_balance()` and the values in `get_portfolio_weights()` all return `None` on API error. Never write `or 0.0` on these: a read failure that reads as zero makes an owned coin look unbought (→ over-buy) or an funded wallet look empty (→ pointless Earn redemption). `get_buy_rebalance_multipliers()` applies no rebalancing at all if any coin is unreadable.
+- **Sizing must use `get_total_coin_holdings()` (spot + staked), not `get_coin_balance()`** — `stake_idle_coin()` parks bought coins in Earn, so portfolio weights would otherwise treat owned-but-staked coins as unbought and over-buy them every run.
+- **DRY_RUN must gate every mutating call**, including `log_trade()` — a simulated fill written to the production ledger corrupts PnL and makes the idempotency gate skip the real run. Dry-run trades go to `log/dryrun_trades.jsonl`.
+- **The idempotency gate fails closed.** `coins_bought_today()` returns `None` when it cannot establish the answer, and the caller skips the run. It is per-coin, so a run that bought ETH and then crashed still buys SOL and TON. `record_local_buy()` is called *before* logging/staking so a crash cannot cause a re-buy.
+- **All paths are absolute** (`BASE_DIR`, `LOG_DIR`): a scheduled run's CWD is not the script directory.
+- Market data resolves through `resolve_symbol()` (configured stablecoin pair, else USDT). Hardcoding `f"{coin}{USD_TYPE}"` for klines silently disables signals for coins without that pair. Spot *orders* still use `{coin}{USD_TYPE}` — that is the coin being spent.
+- `remaining_bal` is decremented using `float(order[2])` (actual USD spent), never the planned amount. `execute_buy()` aggregates a partial spot fill + Convert residual so it never double-spends, and always returns a 4-tuple of strings.
+- Stablecoin is redeemed **after** multipliers are known, or the boosts would be unfundable and therefore inert.
 - All staking calls use `uuid.uuid4().hex[:12]` orderLinkIds; spot buy orders use a deterministic per-day `dca-{coin}-{YYYYMMDD}` orderLinkId (dedup safety net).
 - Timestamps are `datetime.now(timezone.utc)` throughout.
 - Supabase `trade_log` table columns: `trade_id`, `timestamp`, `symbol`, `quantity`, `price`, `total_usd`
