@@ -4,3 +4,4 @@ test.py
 log/
 dca_bot.lock
 __pycache__/
+.pytest_cache/

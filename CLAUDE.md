@@ -23,11 +23,22 @@ you explicitly opt into live trading (`DRY_RUN=false` or `--live`). Set `TESTNET
 to point at Bybit testnet. A run-lock (`dca_bot.lock`) plus an "already traded today"
 check (Supabase `trade_log`, UTC) prevent a double-firing scheduler from buying twice.
 
-There are no tests, linting configs, or build steps — the single entry point is `bybit_bot.py`.
+```bash
+# Run the tests (pure logic, no network, no credentials)
+pytest -q
+```
+
+The entry point is `bybit_bot.py`. There is no CI or linting config.
 
 ## Architecture
 
-Single-file bot (`bybit_bot.py`, ~1050 lines). All logic lives in one file; no packages or modules.
+Two flat modules, no package:
+
+- `bybit_bot.py` (~1100 lines) — orchestration, all I/O, entry point.
+- `dca_core.py` — pure decision logic (sizing, caps, signals, parsers). Imports **stdlib only**, deliberately: the import graph makes it impossible for a sizing function to reach a live `session` or a config global, so it is testable with no mocks.
+- `test_dca_core.py` — 52 tests, no network, sub-second.
+
+Artifacts written to `log/`: dated run logs, `runs.jsonl` (one JSON line per run with the full decision trace — prices, signals, multipliers, planned vs actual), `last_run.json` (local idempotency record), `dryrun_trades.jsonl` (simulated fills, never sent to Supabase).
 
 **Execution flow inside `run_dca_bot()`:**
 1. `ensure_stablecoin_balance()` — redeems from Flexible Saving if spot wallet is low

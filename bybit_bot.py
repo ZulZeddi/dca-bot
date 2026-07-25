@@ -13,6 +13,8 @@ from loguru import logger
 from supabase import create_client
 import pandas as pd
 
+import dca_core as core
+
 # Absolute paths throughout: a scheduled run's working directory is not the
 # script directory, so a relative .env or log path resolves somewhere else
 # (under Task Scheduler, C:\Windows\System32) and fails silently.
@@ -66,6 +68,9 @@ LOCK_PATH = str(BASE_DIR / 'dca_bot.lock')
 DRYRUN_TRADES_PATH = LOG_DIR / 'dryrun_trades.jsonl'
 # Local idempotency record — checked before the remote ledger.
 LAST_RUN_PATH = LOG_DIR / 'last_run.json'
+# One JSON line per run: post-mortem debugging, heartbeat source, and the
+# signal snapshot a future backtest needs (signals are otherwise thrown away).
+RUNS_PATH = LOG_DIR / 'runs.jsonl'
 
 
 # ─── Utilities ────────────────────────────────────────────────────────────────
@@ -128,15 +133,10 @@ def get_total_coin_holdings(session, coin):
     spot-only read makes them look unbought and the bot over-buys them.
     """
     spot = get_coin_balance(session, coin)
-    if spot is None:
-        return None
     cfg = get_stake_config().get(coin.upper())
-    if not cfg:
-        return round(spot, 8)
-    staked = get_staked_balance(session, coin, cfg['category'])
-    if staked is None:
-        return None
-    return round(spot + staked, 8)
+    staked = get_staked_balance(session, coin, cfg['category']) if cfg else 0.0
+    total = core.total_holdings(spot, staked)
+    return None if total is None else round(total, 8)
 
 
 _SYMBOL_CACHE = {}
@@ -290,6 +290,15 @@ def release_run_lock():
         _LOCK_HANDLE = None
 
 
+def write_run_summary(summary):
+    """Appends one JSON line describing this run to log/runs.jsonl."""
+    try:
+        with open(RUNS_PATH, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(summary, default=str) + '\n')
+    except Exception as e:
+        logger.error(f"Run summary write error: {e}")
+
+
 def _read_last_run():
     try:
         if LAST_RUN_PATH.exists():
@@ -383,51 +392,23 @@ def get_bollinger_signal(session, coin, current_price, period=20):
         )
         if not klines['result']['list']:
             return 0.0
-        # API returns newest first; reverse for chronological order
-        closes = [float(k[4]) for k in reversed(klines['result']['list'])]
-        closes = closes[:-1]  # drop incomplete current candle
-        if len(closes) < period:
-            return 0.0
-        closes = closes[-period:]
-        sma = sum(closes) / period
-        std = (sum((c - sma) ** 2 for c in closes) / period) ** 0.5
-        lower = sma - 2 * std
-        upper = sma + 2 * std
-        if current_price < lower:
-            logger.info(f"{coin}: below Bollinger lower band ${lower:.4f} — buy signal")
-            return 1.0
-        if current_price > upper:
-            return -1.0
-        return 0.0
+        # API returns newest first; reverse for chronological order, then drop
+        # the in-progress candle so the bands use completed days only.
+        closes = [float(k[4]) for k in reversed(klines['result']['list'])][:-1]
+        signal = core.bollinger_from_closes(closes, current_price, period)
+        if signal > 0:
+            logger.info(f"{coin}: below Bollinger lower band — buy signal")
+        return signal
     except Exception as e:
         logger.error(f"Bollinger error for {coin}: {e}")
         return 0.0
 
 
 def get_market_boost(session, coin, current_price, fng_value):
-    """
-    Returns buy multiplier based on Fear & Greed Index + Bollinger Bands.
-    Replaces the old avg-price-based DCA boost.
-    """
+    """Buy multiplier from the Fear & Greed Index + Bollinger Bands."""
     max_boost = float(os.getenv('DCA_BOOST_MULTIPLIER', 2.0))
-
-    boost = 1.0
-    if fng_value <= 20:
-        boost += 0.75   # Extreme Fear — buy aggressively
-    elif fng_value <= 40:
-        boost += 0.35   # Fear
-    elif fng_value >= 80:
-        boost -= 0.20   # Extreme Greed — buy less
-    elif fng_value >= 65:
-        boost -= 0.10   # Greed
-
     bb = get_bollinger_signal(session, coin, current_price)
-    if bb > 0:
-        boost += 0.50   # below lower band
-    elif bb < 0:
-        boost -= 0.15   # above upper band
-
-    result = min(max(boost, 0.3), max_boost)
+    result = core.market_boost_from_signals(fng_value, bb, max_boost=max_boost)
     if abs(result - 1.0) > 0.05:
         direction = "boost" if result > 1.0 else "reduce"
         logger.info(f"Market signal {coin}: {direction} x{result:.2f} (F&G={fng_value}, BB={bb:+.0f})")
@@ -457,12 +438,7 @@ def is_flash_crash(session, coin, current_price):
             limit=hours + 1,
         )
         rows = klines['result']['list']
-        if not rows:
-            return False
-        peak = max(float(r[2]) for r in rows)  # highest high in the window
-        if peak <= 0:
-            return False
-        drop_pct = (peak - current_price) / peak * 100
+        drop_pct = core.drawdown_from_high(rows, current_price)
         if drop_pct >= pct_threshold:
             msg = f"⚡ Flash crash: {coin} -{drop_pct:.1f}% from {hours}h high. Skipping buy."
             logger.warning(msg)
@@ -648,24 +624,21 @@ def execute_buy(session, coin, usd_amount):
         result = try_spot_limit_order(session, coin, usd_amount)
         if result:
             spot_val, spot_qty = float(result[2]), float(result[3])
-        if spot_val >= usd_amount * 0.99:
-            # Effectively fully filled on the maker order.
-            return (USD_TYPE, coin, str(spot_val), str(spot_qty))
-        if spot_val > 0:
-            logger.info(f"Spot partial ${spot_val:.2f}/{usd_amount:.2f} for {coin} — converting residual.")
-        else:
-            logger.info(f"Spot order for {coin} unfilled — falling back to convert.")
 
-    residual = usd_amount - spot_val
-    if residual < MIN_CONVERT_USD:
-        if spot_qty > 0:
-            return (USD_TYPE, coin, str(spot_val), str(spot_qty))
-        logger.info(f"{coin}: residual ${residual:.2f} below convert minimum — skipping.")
+    plan = core.plan_partial_fill(usd_amount, spot_val, spot_qty, MIN_CONVERT_USD)
+
+    if plan.convert_usd <= 0:
+        if plan.spot_qty > 0:
+            return (USD_TYPE, coin, str(plan.spot_usd), str(plan.spot_qty))
+        logger.info(f"{coin}: nothing left to buy above the convert minimum — skipping.")
         return (USD_TYPE, coin, "0.0", "0.0")
 
-    conv = convert_coins(session, USD_TYPE, coin, 'eb_convert_uta', residual)
-    total_val = spot_val + float(conv[2])
-    total_qty = spot_qty + float(conv[3])
+    if plan.spot_usd > 0:
+        logger.info(f"Spot partial ${plan.spot_usd:.2f}/{usd_amount:.2f} for {coin} — converting ${plan.convert_usd:.2f} residual.")
+
+    conv = convert_coins(session, USD_TYPE, coin, 'eb_convert_uta', plan.convert_usd)
+    total_val, total_qty = core.aggregate_fill(
+        plan.spot_usd, plan.spot_qty, float(conv[2]), float(conv[3]))
     return (USD_TYPE, coin, str(total_val), str(total_qty))
 
 
@@ -724,18 +697,9 @@ def get_stake_config():
     Parses STAKEABLE_COINS env var.
     Format: 'SOL:OnChain:0.2,ETH:FlexibleSaving:0.001'
             coin:category:liquid_buffer_qty
-    Default keeps original SOL on-chain + adds ETH flexible staking.
     """
-    raw = os.getenv('STAKEABLE_COINS', 'SOL:OnChain:0.2,ETH:FlexibleSaving:0.001')
-    config = {}
-    for entry in raw.split(','):
-        parts = entry.strip().split(':')
-        if len(parts) >= 2:
-            config[parts[0].upper()] = {
-                'category': parts[1],
-                'buffer': float(parts[2]) if len(parts) > 2 else 0.0,
-            }
-    return config
+    return core.parse_stake_config(
+        os.getenv('STAKEABLE_COINS', 'SOL:OnChain:0.2,ETH:FlexibleSaving:0.001'))
 
 
 def stake_idle_coin(session, coin):
@@ -829,32 +793,11 @@ def sweep_stablecoin_surplus(session):
 # ─── Portfolio ─────────────────────────────────────────────────────────────────
 
 def get_crypto_allocation():
-    alloc = {}
-    for pair in os.getenv('CRYPTO_ALLOCATION_STRING', '').split(','):
-        if ':' not in pair:
-            continue
-        s, _, m = pair.strip().partition(':')
-        try:
-            weight = float(m)
-        except ValueError:
-            logger.error(f"Bad allocation entry '{pair.strip()}' — skipping.")
-            continue
-        if weight > 0:
-            alloc[s.upper()] = weight
-    return alloc
+    return core.parse_allocation(os.getenv('CRYPTO_ALLOCATION_STRING', ''))
 
 
 def get_max_prices():
-    prices = {}
-    for pair in os.getenv('MAX_PRICE_STRING', '').split(','):
-        if ':' not in pair:
-            continue
-        coin, _, price = pair.strip().partition(':')
-        try:
-            prices[coin.upper()] = float(price)
-        except ValueError:
-            logger.error(f"Bad max-price entry '{pair.strip()}' — skipping.")
-    return prices
+    return core.parse_max_prices(os.getenv('MAX_PRICE_STRING', ''))
 
 
 def validate_trading_pairs(session, allocation):
@@ -894,30 +837,15 @@ def get_buy_rebalance_multipliers(allocation, portfolio):
     threshold = float(os.getenv('REBALANCE_THRESHOLD', 5))
     boost = float(os.getenv('REBALANCE_MULTIPLIER', 1.5))
 
-    # An incomplete portfolio makes every weight wrong: the unreadable coin
-    # looks like zero holdings (→ spurious boost) and inflates every other
-    # coin's weight. Apply no rebalancing at all rather than a wrong one.
-    if any(v is None for v in portfolio.values()):
-        unreadable = [c for c, v in portfolio.items() if v is None]
+    unreadable = [c for c, v in portfolio.items() if v is None]
+    if unreadable:
         logger.warning(f"Portfolio incomplete ({', '.join(unreadable)}) — skipping buy-rebalance this run.")
-        return {coin: 1.0 for coin in allocation}
 
-    total_value = sum(portfolio.values())
-    if total_value == 0:
-        return {coin: 1.0 for coin in allocation}
-
-    total_alloc = sum(allocation.values())
-    multipliers = {}
-    for coin in allocation:
-        target_w = allocation[coin] / total_alloc
-        current_w = portfolio.get(coin, 0) / total_value
-        drift = (target_w - current_w) * 100
-        if drift > threshold:
-            multipliers[coin] = boost
-            logger.info(f"⚖️ Buy-rebalance: {coin} underweight {drift:.1f}% → x{boost}")
-            send_telegram(f"⚖️ Rebalance: {coin} underweight {drift:.1f}%, applying x{boost} buy boost")
-        else:
-            multipliers[coin] = 1.0
+    multipliers = core.rebalance_multipliers(allocation, portfolio, threshold, boost)
+    for coin, m in multipliers.items():
+        if m != 1.0:
+            logger.info(f"⚖️ Buy-rebalance: {coin} underweight → x{m}")
+            send_telegram(f"⚖️ Rebalance: {coin} underweight, applying x{m} buy boost")
     return multipliers
 
 
@@ -938,7 +866,10 @@ def calculate_PnL(session, from_date=None, to_date=None):
 
         trades = pd.DataFrame(data_resp.data)
         trades['timestamp'] = pd.to_datetime(trades['timestamp'])
-        trades['symbol'] = trades['symbol'].apply(lambda x: x.replace(USD_TYPE, ''))
+        # Group by BASE asset: history holds both ETHUSDT and ETHUSDC rows from
+        # past stablecoin switches, and a substring replace would drop one half
+        # of the invested capital while still pricing the full quantity.
+        trades['symbol'] = trades['symbol'].apply(lambda s: core.normalize_symbol(s)[0])
 
         mask = trades['price'].isnull() & (trades['quantity'] > 0)
         trades.loc[mask, 'price'] = trades.loc[mask, 'total_usd'] / trades.loc[mask, 'quantity']
@@ -951,7 +882,11 @@ def calculate_PnL(session, from_date=None, to_date=None):
             total_invested = st['total_usd'].sum()
             total_qty = st['quantity'].sum()
 
-            ticker = session.get_tickers(category='spot', symbol=f"{symbol}{USD_TYPE}")
+            market_symbol = resolve_symbol(session, symbol)
+            if not market_symbol:
+                logger.warning(f"PnL: no market pair for {symbol} — omitted from report.")
+                continue
+            ticker = session.get_tickers(category='spot', symbol=market_symbol)
             if not ticker['result']['list']:
                 continue
 
@@ -986,6 +921,31 @@ def send_periodic_report(session, period):
 # ─── Main DCA ──────────────────────────────────────────────────────────────────
 
 def run_dca_bot(session):
+    """Runs one DCA cycle and always records a run summary, however it ends."""
+    run = {
+        'run_id': uuid.uuid4().hex[:12],
+        'started_at': datetime.now(timezone.utc).isoformat(),
+        'dry_run': DRY_RUN,
+        'testnet': TESTNET,
+        'stablecoin': USD_TYPE,
+        'daily_usd': DAILY_USD,
+        'coins': {},
+        'errors': [],
+        'total_spent': 0.0,
+        'outcome': 'unknown',
+    }
+    try:
+        _run_dca(session, run)
+    except BaseException as e:
+        run['outcome'] = 'crashed'
+        run['errors'].append(f"{type(e).__name__}: {e}")
+        raise
+    finally:
+        run['ended_at'] = datetime.now(timezone.utc).isoformat()
+        write_run_summary(run)
+
+
+def _run_dca(session, run):
     logger.info(f"DCA bot starting. Stablecoin: {USD_TYPE}")
     send_telegram(f"🤖 DCA Bot starting. Stablecoin: {USD_TYPE}")
 
@@ -997,6 +957,7 @@ def run_dca_bot(session):
     if not allocation:
         logger.error("No allocation in CRYPTO_ALLOCATION_STRING.")
         send_telegram("❌ No allocation found. DCA aborted.")
+        run['outcome'] = 'no_allocation'
         return
 
     # Idempotency, per coin: a run that bought ETH and then died must still be
@@ -1007,12 +968,14 @@ def run_dca_bot(session):
         if bought is None:
             logger.error("Cannot verify today's trades (ledger unreachable). Skipping run.")
             send_telegram("⛔ DCA skipped: cannot verify today's trades (ledger unreachable).")
+            run['outcome'] = 'ledger_unreachable'
             return
         if bought:
             allocation = {c: w for c, w in allocation.items() if c not in bought}
             logger.info(f"Already bought today: {', '.join(sorted(bought))}.")
             if not allocation:
                 send_telegram("✅ Today's DCA already executed for all coins — skipping.")
+                run['outcome'] = 'already_done'
                 return
             send_telegram(f"ℹ️ Already bought today: {', '.join(sorted(bought))}. Buying the remaining coins.")
 
@@ -1026,12 +989,14 @@ def run_dca_bot(session):
                f"Check DAILY_USD / allocation weights. DCA aborted.")
         logger.error(msg)
         send_telegram(msg)
+        run['outcome'] = 'config_over_cap'
         return
 
     max_prices = get_max_prices()
     use_market_boost = os.getenv('USE_MARKET_BOOST', 'true').lower() == 'true'
 
     fng_value = get_fear_greed_index() if use_market_boost else 50
+    run['fng'] = fng_value
     portfolio = get_portfolio_weights(session, allocation)
     rebalance_multipliers = get_buy_rebalance_multipliers(allocation, portfolio)
 
@@ -1040,14 +1005,19 @@ def run_dca_bot(session):
 
     for coin, mult in allocation.items():
         base_buy_usd = mult * DAILY_USD
+        info = run['coins'].setdefault(coin, {})
+        info['base_usd'] = base_buy_usd
         current_price = get_current_price(session, coin)
+        info['price'] = current_price
 
         if current_price is None:
             send_telegram(f"❌ No price for {coin}. Skipping.")
+            info['skipped'] = 'no_price'
             continue
 
         # Circuit breaker: skip on flash crash
         if is_flash_crash(session, coin, current_price):
+            info['skipped'] = 'flash_crash'
             continue
 
         # Max price guard
@@ -1056,38 +1026,34 @@ def run_dca_bot(session):
             msg = f"⏭️ {coin}: ${current_price:,.2f} > max ${max_price:,.2f}. Skipping."
             logger.info(msg)
             send_telegram(msg)
+            info['skipped'] = 'above_max_price'
             continue
 
-        buy_usd = base_buy_usd
+        boost = get_market_boost(session, coin, current_price, fng_value) if use_market_boost else 1.0
+        rebal = rebalance_multipliers.get(coin, 1.0)
+        info['boost'] = boost
+        info['rebalance'] = rebal
 
-        # Market boost (Fear & Greed + Bollinger)
-        if use_market_boost:
-            buy_usd *= get_market_boost(session, coin, current_price, fng_value)
-
-        # Buy-side rebalance boost — applied after market boost
-        buy_usd *= rebalance_multipliers.get(coin, 1.0)
-
-        # Bound the product of all stacked multipliers (VA × boost × rebalance)
-        # so they can't compound into a runaway buy.
-        buy_usd = min(buy_usd, base_buy_usd * MAX_COMBINED_MULTIPLIER)
-
-        desired_buys[coin] = buy_usd
+        # The product of correlated multipliers is clamped, not just each one.
+        desired_buys[coin] = core.combine_multipliers(
+            base_buy_usd, boost, rebal, max_combined=MAX_COMBINED_MULTIPLIER)
+        info['planned_usd'] = desired_buys[coin]
 
     if not desired_buys:
         logger.info("No coins to buy this run.")
         send_telegram("ℹ️ No coins to buy this run (all skipped).")
         sweep_stablecoin_surplus(session)
+        run['outcome'] = 'all_skipped'
         return
 
     # ── Step 2: Cap, fund, then scale ──
-    total_desired = sum(desired_buys.values())
-    # Absolute spend ceiling — last line of defence against multiplier runaway.
-    if total_desired > MAX_SPEND_PER_RUN:
-        scale = MAX_SPEND_PER_RUN / total_desired
-        logger.warning(f"Spend cap: scaling all buys by {scale:.2%} to stay within ${MAX_SPEND_PER_RUN:.2f}")
+    # Absolute spend ceiling first — last line of defence against a multiplier
+    # runaway or a config typo.
+    desired_buys, capped = core.apply_spend_caps(desired_buys, MAX_SPEND_PER_RUN, None)
+    if capped:
+        logger.warning(f"Spend cap hit — scaling buys to ${MAX_SPEND_PER_RUN:.2f}")
         send_telegram(f"🛡️ Spend cap hit — scaling buys to ${MAX_SPEND_PER_RUN:.2f}")
-        desired_buys = {coin: amt * scale for coin, amt in desired_buys.items()}
-        total_desired = MAX_SPEND_PER_RUN
+    total_desired = sum(desired_buys.values())
 
     # Fund AFTER the multipliers are known. Redeeming only the pre-boost base
     # would leave the boosts unfundable, so they would never actually apply.
@@ -1095,19 +1061,21 @@ def run_dca_bot(session):
     if current_bal is None:
         logger.error("Stablecoin balance unavailable. DCA aborted.")
         send_telegram("❌ DCA aborted: stablecoin balance unavailable.")
+        run['outcome'] = 'balance_unavailable'
         return
     if current_bal < MIN_CONVERT_USD:
         msg = f"❌ Insufficient {USD_TYPE} ({current_bal:.2f}) — nothing to buy. DCA aborted."
         logger.error(msg)
         send_telegram(msg)
+        run['outcome'] = 'insufficient_funds'
+        run['available'] = current_bal
         return
 
     # Scale to available balance (prevents dict-order coins starving later ones).
-    if total_desired > current_bal:
-        scale = current_bal / total_desired
-        logger.warning(f"Partial funding {current_bal:.2f}/{total_desired:.2f} {USD_TYPE} — scaling buys by {scale:.2%}")
+    desired_buys, limited = core.apply_spend_caps(desired_buys, None, current_bal)
+    if limited:
+        logger.warning(f"Partial funding {current_bal:.2f}/{total_desired:.2f} {USD_TYPE} — scaling buys down.")
         send_telegram(f"⚠️ Partial funding {current_bal:.2f}/{total_desired:.2f} {USD_TYPE} — scaling buys down.")
-        desired_buys = {coin: amt * scale for coin, amt in desired_buys.items()}
 
     # ── Step 3: Execute buys ──
     remaining_bal = current_bal
@@ -1115,8 +1083,12 @@ def run_dca_bot(session):
     bought_coins = []
 
     for coin, buy_usd in desired_buys.items():
+        info = run['coins'].setdefault(coin, {})
+        info['final_usd'] = buy_usd
+
         if remaining_bal < buy_usd * 0.95:
             logger.warning(f"Insufficient balance for {coin} (need {buy_usd:.2f}, have {remaining_bal:.2f}). Skipping.")
+            info['skipped'] = 'insufficient_remaining'
             continue
 
         logger.info(f"Buying {coin}: ${buy_usd:.2f} {USD_TYPE}")
@@ -1128,11 +1100,13 @@ def run_dca_bot(session):
 
             actual_usd = float(order[2])
             actual_qty = float(order[3])
-            if actual_qty > 0 and actual_usd > 0:
+            fill_price = core.implied_price(actual_usd, actual_qty)
+            if fill_price is not None:
                 # Decrement only what was actually spent
                 remaining_bal -= actual_usd
                 spent_total += actual_usd
                 bought_coins.append(coin)
+                info.update(actual_usd=actual_usd, actual_qty=actual_qty, fill_price=fill_price)
 
                 # Record locally FIRST: if logging or staking then fails, a
                 # re-run must still know this coin was already bought today.
@@ -1141,18 +1115,26 @@ def run_dca_bot(session):
                 log_trade(
                     symbol=f"{coin}{USD_TYPE}",
                     quantity=actual_qty,
-                    price=actual_usd / actual_qty,
+                    price=fill_price,
                     total_usd=actual_usd,
                 )
 
                 # Auto-stake newly accumulated balance
                 stake_idle_coin(session, coin)
+            else:
+                info['skipped'] = 'no_fill'
         except Exception as e:
             logger.exception(f"Buy failed for {coin}: {e}")
             send_telegram(f"❌ Buy failed for {coin}: {e}")
+            info['error'] = f"{type(e).__name__}: {e}"
+            run['errors'].append(f"{coin}: {type(e).__name__}: {e}")
 
     # ── Step 4: Sweep surplus stablecoin to Flexible Saving ──
     sweep_stablecoin_surplus(session)
+
+    run['total_spent'] = spent_total
+    run['bought'] = bought_coins
+    run['outcome'] = 'ok' if bought_coins else 'nothing_bought'
 
     summary = (f"✅ Run complete{' [DRY RUN]' if DRY_RUN else ''}: "
                f"spent ${spent_total:.2f} {USD_TYPE} on {len(bought_coins)} coin(s)"
