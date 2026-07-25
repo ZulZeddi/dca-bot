@@ -1,8 +1,6 @@
-requests
-pandas
-schedule
-binance-connector
-python-dotenv
-pybit
-loguru
-supabase
+requests==2.31.0
+pandas==2.2.2
+python-dotenv==1.1.0
+pybit==5.11.0
+loguru==0.7.3
+supabase==2.27.0
